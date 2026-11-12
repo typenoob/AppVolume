@@ -1,0 +1,7 @@
+dist/
+.toolchain/
+.analysis/
+build/
+*.o
+*.dylib
+.DS_Store
