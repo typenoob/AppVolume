@@ -28,7 +28,7 @@ fi
     -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-deprecated-declarations \
     -dynamiclib "${LINKER_FLAGS[@]}" \
     -Wl,-install_name,@rpath/AppVolume.dylib \
-    "$ROOT/src/AppVolume.m" "$ROOT/src/AudioQueueVolume.c" "$ROOT/vendor/fishhook/fishhook.c" \
+    "$ROOT/src/AppVolume.m" "$ROOT/src/AudioQueueVolume.c" "$ROOT/src/AudioUnitVolume.c" "$ROOT/vendor/fishhook/fishhook.c" \
     -framework Foundation -framework UIKit -framework AVFoundation -framework CoreMedia \
     -framework AudioToolbox -framework CoreFoundation -lobjc -lpthread \
     -o "$OUTPUT/AppVolume.dylib"

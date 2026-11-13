@@ -1,4 +1,5 @@
 #include "AudioQueueVolume.h"
+#include "AudioUnitVolume.h"
 #include "VolumePolicy.h"
 #include <AudioToolbox/AudioQueue.h>
 #include <pthread.h>
@@ -234,7 +235,10 @@ static void QAVBindQueueImage(const struct mach_header *header, intptr_t slide, 
         {"AudioQueueGetParameter", QAVGetQueueParameter, NULL},
         {"AudioQueueStart", QAVStartQueue, NULL},
         {"AudioQueueEnqueueBuffer", QAVEnqueueBuffer, NULL},
-        {"AudioQueueDispose", QAVDisposeQueue, NULL}
+        {"AudioQueueDispose", QAVDisposeQueue, NULL},
+        {"AudioOutputUnitStart", QAVStartOutputUnit, NULL},
+        {"AudioOutputUnitStop", QAVStopOutputUnit, NULL},
+        {"AudioComponentInstanceDispose", QAVDisposeComponentInstance, NULL}
     };
     int result = rebind_symbols_image((void *)header, slide, bindings, sizeof(bindings) / sizeof(bindings[0]));
     pthread_mutex_lock(&QAVQueueLock);
@@ -260,8 +264,9 @@ static void QAVBindLoadedImages(void) {
 }
 #endif
 
-void QAVAudioQueueInstall(const char *appBundlePath, float gain, bool enabled) {
+void QAVNativeAudioInstall(const char *appBundlePath, float gain, bool enabled) {
     QAVAudioQueueSetGain(gain, enabled);
+    QAVAudioUnitSetGain(gain, enabled);
 #ifndef QAV_AUDIOQUEUE_TEST
     Dl_info ownInfo;
     if (!appBundlePath) {
@@ -274,7 +279,7 @@ void QAVAudioQueueInstall(const char *appBundlePath, float gain, bool enabled) {
         QAVRecordQueueError(-50);
         return;
     }
-    if (!dladdr((void *)QAVAudioQueueInstall, &ownInfo)) {
+    if (!dladdr((void *)QAVNativeAudioInstall, &ownInfo)) {
         QAVSetInstallState(-3, 0);
         QAVRecordQueueError(-50);
         return;

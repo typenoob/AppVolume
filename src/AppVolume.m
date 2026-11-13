@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import "VolumePolicy.h"
 #import "AudioQueueVolume.h"
+#import "AudioUnitVolume.h"
 
 static NSRecursiveLock *QAVLock;
 static NSHashTable *QAVPlayers;
@@ -113,6 +114,7 @@ static void QAVUpdate(float gain, BOOL enabled) {
     QAVGeneration++;
     [QAVLock unlock];
     QAVAudioQueueSetGain(gain, enabled);
+    QAVAudioUnitSetGain(gain, enabled);
     QAVReapplyAll();
     [[NSUserDefaults standardUserDefaults] setObject:@{@"gain": @(gain), @"enabled": @(enabled)} forKey:QAVPreferenceKey];
     [NSNotificationCenter.defaultCenter postNotificationName:QAVSettingsChanged object:nil];
@@ -419,14 +421,25 @@ static void QAVHookEngine(void) {
     BOOL mixerActive = QAVMixerRegistered;
     [QAVLock unlock];
     QAVAudioQueueDiagnostics queues = QAVAudioQueueGetDiagnostics();
+    QAVAudioUnitDiagnostics units = QAVAudioUnitGetDiagnostics();
     char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
     QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
-    self.diagnostics.text = [NSString stringWithFormat:@"AVFoundation：%lu 个\nAVAudioEngine 混音器：%@\nAudioQueue：%llu 个（累计 %llu）\n队列音量应用：%llu 次\n已扫描应用模块：%llu / 已见模块：%llu\n模块拦截状态：%d（errno %d，错误 %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染时生效。",
+    self.diagnostics.text = [NSString stringWithFormat:@"AVFoundation：%lu 个\nAVAudioEngine 混音器：%@\nAudioQueue：%llu 个（累计 %llu）\n队列音量应用：%llu 次\nAudioUnit：挂载 %llu / 卸载 %llu，缩放 %llu 帧\n输入侧帧数：%llu，格式不支持：%llu\n单元格式：%u bit %@，%u 声道，最近 bus %d，错误 %d\n已扫描应用模块：%llu / 已见模块：%llu\n模块拦截状态：%d（errno %d，错误 %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染时生效。",
         (unsigned long)count,
         mixerActive ? @"已接管（节点音量不再重复衰减）" : @"未接管",
         (unsigned long long)queues.activeQueues,
         (unsigned long long)queues.createdQueues,
         (unsigned long long)queues.appliedChanges,
+        (unsigned long long)units.attachedUnits,
+        (unsigned long long)units.detachedUnits,
+        (unsigned long long)units.scaledFrames,
+        (unsigned long long)units.inputFramesSeen,
+        (unsigned long long)units.formatFailures,
+        units.lastBitsPerChannel,
+        units.lastIsFloat ? @"浮点" : @"整型",
+        units.lastChannels,
+        units.lastBusNumber,
+        units.lastError,
         (unsigned long long)queues.scannedImages,
         (unsigned long long)queues.seenImages,
         queues.installStatus,
@@ -553,7 +566,7 @@ __attribute__((constructor)) static void QAVInitialize(void) {
         QAVHookClass(@"AVSampleBufferAudioRenderer", @selector(setVolume:), volume);
         QAVHookClass(@"AVAudioMixerNode", @selector(setOutputVolume:), @selector(outputVolume));
         QAVHookEngine();
-        QAVAudioQueueInstall(bundle.bundlePath.fileSystemRepresentation, QAVGain, QAVEnabled);
+        QAVNativeAudioInstall(bundle.bundlePath.fileSystemRepresentation, QAVGain, QAVEnabled);
         dispatch_async(dispatch_get_main_queue(), ^{
             static QAVUIManager *manager;
             manager = [QAVUIManager new];

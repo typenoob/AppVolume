@@ -1,4 +1,5 @@
 #include "../src/VolumePolicy.h"
+#include "../src/SampleGain.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -49,6 +50,27 @@ int main(void) {
     expect(QAVRequestedVolumeAt(fade, 13.0), 0.4f);
     fade = QAVBeginFade(fade, 0.6f, -1.0, 13.0);
     expect(QAVRequestedVolumeAt(fade, 13.0), 0.6f);
-    puts("PASS: relative gain, independent players, no cumulative attenuation, mute, restore, enable toggle, invalid saved gain, and fade transitions");
+    float pcm[] = {1.0f, -0.5f, 0.25f, 0.0f};
+    QAVApplySampleGain(pcm, sizeof(pcm), 32, true, 0.5f);
+    expect(pcm[0], 0.5f);
+    expect(pcm[1], -0.25f);
+    expect(pcm[2], 0.125f);
+    expect(pcm[3], 0.0f);
+    int16_t s16[] = {32767, -32768, 1000, 0};
+    QAVApplySampleGain(s16, sizeof(s16), 16, false, 0.5f);
+    assert(s16[0] == 16384 && s16[1] == -16384 && s16[2] == 500 && s16[3] == 0);
+    int32_t s32[] = {1073741823, -1073741824, 65536, 1};
+    QAVApplySampleGain(s32, sizeof(s32), 32, false, 0.5f);
+    assert(s32[0] == 536870911 && s32[1] == -536870912 && s32[2] == 32768 && s32[3] == 0);
+    int16_t passthrough[] = {12345, -9876};
+    QAVApplySampleGain(passthrough, sizeof(passthrough), 24, false, 0.5f);
+    assert(passthrough[0] == 12345 && passthrough[1] == -9876);
+    float unchanged[] = {0.75f, -0.25f};
+    QAVApplySampleGain(unchanged, sizeof(unchanged), 32, true, 1.0f);
+    expect(unchanged[0], 0.75f);
+    expect(unchanged[1], -0.25f);
+    QAVApplySampleGain(NULL, 64, 32, true, 0.5f);
+    QAVApplySampleGain(s16, 0, 16, false, 0.5f);
+    puts("PASS: relative gain, independent players, no cumulative attenuation, mute, restore, enable toggle, invalid saved gain, fade transitions, and sample buffer scaling");
     return 0;
 }

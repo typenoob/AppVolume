@@ -16,7 +16,8 @@ typedef struct {
     int32_t installErrno;
 } QAVAudioQueueDiagnostics;
 
-void QAVAudioQueueInstall(const char *appBundlePath, float gain, bool enabled);
+// Scans the app's own images once and binds both AudioQueue and direct Audio Unit entry points in them.
+void QAVNativeAudioInstall(const char *appBundlePath, float gain, bool enabled);
 void QAVAudioQueueSetGain(float gain, bool enabled);
 QAVAudioQueueDiagnostics QAVAudioQueueGetDiagnostics(void);
 
