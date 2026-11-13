@@ -399,7 +399,7 @@ static void QAVHookEngine(void) {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel *title = [UILabel new];
-    title.text = @"App 独立音量 · 0.4.3";
+    title.text = @"App 独立音量 · 0.4.4";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     UILabel *app = [UILabel new];
     app.text = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: NSBundle.mainBundle.bundleIdentifier;
@@ -491,23 +491,6 @@ static void QAVHookEngine(void) {
     [QAVLock unlock];
     return [parts componentsJoinedByString:@" "];
 }
-// One line per candidate the speaker stream could be, with how many frames each actually scaled: when 缓冲不符
-// climbs, the observed render geometry printed next to these candidates shows which assumption is wrong.
-- (NSString *)candidateSummary:(QAVAudioUnitDiagnostics)units {
-    if (!units.candidateCount) {
-        return units.liveSlots
-            ? [NSString stringWithFormat:@"无（%u 个在跑的单元都没探到可用格式，见下面 status 与未识别格式）", units.liveSlots]
-            : @"无（没有已挂载且在跑的 Audio Unit）";
-    }
-    NSMutableArray<NSString *> *parts = [NSMutableArray new];
-    for (uint32_t index = 0; index < units.candidateCount && index < QAV_AUDIO_UNIT_CANDIDATES; index++) {
-        [parts addObject:[NSString stringWithFormat:@"c%u %uB/帧 %u bit %@，缩放 %llu 帧",
-            index, units.candidateBytesPerFrame[index], units.candidateBits[index],
-            units.candidateIsFloat[index] ? @"浮点" : @"整型",
-            (unsigned long long)units.framesPerCandidate[index]]];
-    }
-    return [parts componentsJoinedByString:@"；"];
-}
 // The fourcc as the SDK writes it, so an unexpected component subtype or a rejected mFormatID can be read off the
 // panel instead of guessed from a decimal code.
 static NSString *QAVFourCC(uint32_t value) {
@@ -521,13 +504,46 @@ static NSString *QAVFourCC(uint32_t value) {
     [text appendString:@"'"];
     return text;
 }
-// Kept whenever a readable stream description was still refused: the exact bits/channels/bytes-per-frame tell apart
-// a 24-bit packed layout, a padded one, and a probe that simply has no format yet.
-- (NSString *)rejectedFormatSummary:(QAVAudioUnitDiagnostics)units {
-    if (!units.rejectedFormatID) return @"无（两份描述都探不到，或已被候选覆盖）";
-    return [NSString stringWithFormat:@"%@ %.0fHz，%u bit，%u 声道，%u B/帧，flags 0x%X",
-        QAVFourCC(units.rejectedFormatID), units.rejectedSampleRate, units.rejectedBits, units.rejectedChannels,
-        units.rejectedBytesPerFrame, units.rejectedFlags];
+// One line per candidate this unit's speaker stream could be, with how many frames each actually scaled: when
+// 缓冲不符 climbs, the observed render geometry printed next to these candidates shows which assumption is wrong.
+// A unit with no candidate shows the description it refused, verbatim, or says both reads failed.
+- (NSString *)rowCandidateSummary:(QAVAudioUnitRow *)row {
+    if (!row->candidateCount) {
+        if (!row->rejectedFormatID) return @"无候选（两份流描述都读不到，看下面 status）";
+        return [NSString stringWithFormat:@"无候选，被拒描述：%@ %.0fHz，%u bit，%u 声道，%u B/帧，flags 0x%X",
+            QAVFourCC(row->rejectedFormatID), row->rejectedSampleRate, row->rejectedBits, row->rejectedChannels,
+            row->rejectedBytesPerFrame, row->rejectedFlags];
+    }
+    NSMutableArray<NSString *> *parts = [NSMutableArray new];
+    for (uint32_t index = 0; index < row->candidateCount && index < QAV_AUDIO_UNIT_CANDIDATES; index++) {
+        [parts addObject:[NSString stringWithFormat:@"c%u %uB/帧 %u bit %@，缩放 %llu 帧",
+            index, row->candidateBytesPerFrame[index], row->candidateBits[index],
+            row->candidateIsFloat[index] ? @"浮点" : @"整型",
+            (unsigned long long)row->framesPerCandidate[index]]];
+    }
+    return [NSString stringWithFormat:@"候选：%@", [parts componentsJoinedByString:@"；"]];
+}
+// Every attached and running unit gets its own lines. A live room holds at least two output units — one with EnableIO
+// on for the speaker, one for the microphone — and their readings mean opposite things, so a blended summary could
+// not tell 「the playback unit has no format」 from 「this row is the capture unit」. The fourcc in brackets is what
+// the unit was created as ('auou'/'rioc' is RemoteIO, 'vpio' is VoiceProcessingIO); "-" means we only saw its start.
+- (NSString *)unitRowsSummary:(QAVAudioUnitDiagnostics)units {
+    if (!units.rowCount)
+        return @"单元：没有已挂载且在跑的 Audio Unit（「观察」不为 0 说明它挂上后又被卸载了）";
+    NSMutableString *text = [NSMutableString new];
+    for (uint32_t index = 0; index < units.rowCount; index++) {
+        QAVAudioUnitRow *row = &units.rows[index];
+        [text appendFormat:@"单元%u [%@/%@] 喇叭渲染 %llu 次，缩放 %llu 帧，补探 %u/%d 次\n%@\nEnableIO 出%d 入%d｜status 喂入%d 硬件%d 麦%d｜实测 %u 帧 / %u 字节 / %u 个缓冲\n",
+            index + 1, QAVFourCC(row->componentType), QAVFourCC(row->componentSubType),
+            (unsigned long long)row->speakerRenders, (unsigned long long)row->scaledFrames,
+            row->reprobes, QAV_AUDIO_UNIT_REPROBES,
+            [self rowCandidateSummary:row],
+            row->speakerIO, row->micIO, row->feedStatus, row->hardwareStatus, row->micFormatStatus,
+            row->renderFrames, row->renderBytes, row->renderBuffers];
+    }
+    if (units.liveSlots > units.rowCount)
+        [text appendFormat:@"（还有 %u 个在跑的单元没列出）\n", units.liveSlots - units.rowCount];
+    return text;
 }
 - (void)refreshDiagnostics {
     [QAVLock lock];
@@ -539,7 +555,7 @@ static NSString *QAVFourCC(uint32_t value) {
     char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
     QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
     self.diagnostics.text = [NSString stringWithFormat:
-        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个，在跑 %u 个，App 内新建 %llu 个（最近类型 %@/%@）\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n候选格式：%@\n实测渲染：%u 帧 / %u 字节 / %u 个缓冲\n喇叭格式 status：输入 %d，输出 %d，%u 声道，%u B/帧\n未识别格式：%@\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，格式写入 %llu 次，认不出格式 %llu 个，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
+        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个，在跑 %u 个，App 内新建 %llu 个（最近类型 %@/%@）\n合计：喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n格式事件 %llu 次，当前认不出格式 %llu 个，挂载错误 %d\n%@\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
         (unsigned long)count,
         [self setterHitSummary],
         [self mixerSummaryLockedRead],
@@ -560,22 +576,10 @@ static NSString *QAVFourCC(uint32_t value) {
         (unsigned long long)units.framesPerBus[1],
         (unsigned long long)units.framesPerBus[2],
         (unsigned long long)units.framesPerBus[3],
-        [self candidateSummary:units],
-        units.renderFrames,
-        units.renderBytes,
-        units.renderBuffers,
-        units.speakerFormatStatus,
-        units.hardwareFormatStatus,
-        units.speakerChannels,
-        units.speakerBytesPerFrame,
-        [self rejectedFormatSummary:units],
-        units.micFormatStatus,
-        units.micBitsPerChannel,
-        units.speakerIO,
-        units.micIO,
         (unsigned long long)units.formatEvents,
         (unsigned long long)units.formatFailures,
         units.lastError,
+        [self unitRowsSummary:units],
         (unsigned long long)queues.scannedImages,
         (unsigned long long)queues.seenImages,
         queues.installStatus,
