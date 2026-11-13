@@ -37,6 +37,15 @@ static QAVVolumeHooks QAVMixerHooks;
 static BOOL QAVMixerHooksAvailable;
 static BOOL QAVMixerRegistered;
 
+// Every IMP this dylib installs, so a subclass that merely inherits one of them is not wrapped a second time and
+// asked to scale the same volume twice.
+static NSMutableSet *QAVInstalledIMPs;
+static NSMutableDictionary<NSString *, NSNumber *> *QAVSetterHits;
+static NSUInteger QAVMixerWrites;
+static float QAVMixerRequested;
+static float QAVMixerApplied;
+static NSString *QAVMixerClassName;
+
 @interface QAVPlayerState : NSObject
 @property(nonatomic) QAVVolumePolicy policy;
 @property(nonatomic) QAVVolumeHooks hooks;
@@ -134,6 +143,12 @@ static void QAVPreparePlayback(id player, QAVVolumeHooks hooks) {
 
 static void QAVReplace(Class cls, SEL selector, IMP replacement) {
     Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return;
+    [QAVLock lock];
+    BOOL inherited = [QAVInstalledIMPs containsObject:[NSValue valueWithPointer:method_getImplementation(method)]];
+    [QAVInstalledIMPs addObject:[NSValue valueWithPointer:replacement]];
+    [QAVLock unlock];
+    if (inherited) return;
     if (!class_addMethod(cls, selector, replacement, method_getTypeEncoding(method))) {
         method_setImplementation(class_getInstanceMethod(cls, selector), replacement);
     }
@@ -173,19 +188,34 @@ static void QAVMarkMixerActive(void) {
     if (firstTime) QAVReapplyAll();
 }
 
-static void QAVHookClass(NSString *name, SEL setVolumeSelector, SEL getVolumeSelector) {
-    Class cls = NSClassFromString(name);
+// Resolves the untouched accessors of a class, or reports that a hook of ours already answers them, so a subclass
+// that merely inherits one can never be captured as if it were the native implementation and scale twice.
+static BOOL QAVResolveNativeHooks(Class cls, SEL setVolumeSelector, SEL getVolumeSelector, QAVVolumeHooks *out) {
     Method setMethod = class_getInstanceMethod(cls, setVolumeSelector);
     Method getMethod = class_getInstanceMethod(cls, getVolumeSelector);
-    if (!setMethod || !getMethod) return;
-    BOOL isMixer = [name isEqualToString:@"AVAudioMixerNode"];
-    QAVVolumeHooks hooks = {
-        .setter = (void *)method_getImplementation(setMethod),
-        .getter = (void *)method_getImplementation(getMethod),
+    if (!setMethod || !getMethod) return NO;
+    IMP setter = method_getImplementation(setMethod);
+    IMP getter = method_getImplementation(getMethod);
+    [QAVLock lock];
+    BOOL alreadyHooked = [QAVInstalledIMPs containsObject:[NSValue valueWithPointer:setter]] ||
+                         [QAVInstalledIMPs containsObject:[NSValue valueWithPointer:getter]];
+    [QAVLock unlock];
+    if (alreadyHooked) return NO;
+    *out = (QAVVolumeHooks){
+        .setter = (void *)setter,
+        .getter = (void *)getter,
         .setSelector = setVolumeSelector,
-        .getSelector = getVolumeSelector,
-        .defersToMixer = [name isEqualToString:@"AVAudioPlayerNode"]
+        .getSelector = getVolumeSelector
     };
+    return YES;
+}
+
+static void QAVHookVolumeClass(Class cls, NSString *name, SEL setVolumeSelector, SEL getVolumeSelector) {
+    if (!cls) return;
+    BOOL isMixer = [name isEqualToString:@"AVAudioMixerNode"];
+    QAVVolumeHooks hooks;
+    if (!QAVResolveNativeHooks(cls, setVolumeSelector, getVolumeSelector, &hooks)) return;
+    hooks.defersToMixer = [name isEqualToString:@"AVAudioPlayerNode"];
     if (isMixer) {
         QAVMixerHooks = hooks;
         QAVMixerHooksAvailable = YES;
@@ -203,9 +233,22 @@ static void QAVHookClass(NSString *name, SEL setVolumeSelector, SEL getVolumeSel
         QAVPlayerState *state = QAVRegisterLocked(player, hooks, volume);
         state.policy = (QAVVolumePolicy){ .requestedVolume = volume };
         state.revision++;
+        QAVSetterHits[name] = @(QAVSetterHits[name].unsignedIntegerValue + 1);
         [QAVLock unlock];
         QAVApplyLatest(player);
-        if (isMixer) QAVMarkMixerActive();
+        if (!isMixer) return;
+        // Read the value back through the untouched accessor: it is the only proof that the scaled volume landed
+        // on the object the engine actually mixes with, rather than on a class we merely thought was in charge.
+        QAVInternalVolumeWrite++;
+        float applied = hooks.getter(player, getVolumeSelector);
+        QAVInternalVolumeWrite--;
+        [QAVLock lock];
+        QAVMixerWrites++;
+        QAVMixerRequested = volume;
+        QAVMixerApplied = applied;
+        QAVMixerClassName = NSStringFromClass([player class]);
+        [QAVLock unlock];
+        QAVMarkMixerActive();
     }));
 
     QAVReplace(cls, getVolumeSelector, imp_implementationWithBlock(^float(id player) {
@@ -293,9 +336,23 @@ static void QAVHookClass(NSString *name, SEL setVolumeSelector, SEL getVolumeSel
     }
 }
 
+static void QAVHookClass(NSString *name, SEL setVolumeSelector, SEL getVolumeSelector) {
+    QAVHookVolumeClass(NSClassFromString(name), name, setVolumeSelector, getVolumeSelector);
+}
+
 static void QAVAdoptEngineMixer(id engine) {
     AVAudioNode *mixer = [(AVAudioEngine *)engine mainMixerNode];
     if (!mixer) return;
+    Class concrete = object_getClass(mixer);
+    Class declared = NSClassFromString(@"AVAudioMixerNode");
+    // A private mixer subclass can override the accessors, so the hook belongs on the class that answers the call.
+    // An isa-swizzled KVO class is left alone: replacing its setter would swallow the observer's notifications.
+    if (concrete && declared && concrete != declared && concrete == mixer.class) {
+        QAVHookVolumeClass(concrete, @"AVAudioMixerNode", @selector(setOutputVolume:), @selector(outputVolume));
+    }
+    [QAVLock lock];
+    QAVMixerClassName = NSStringFromClass(mixer.class);
+    [QAVLock unlock];
     QAVPreparePlayback(mixer, QAVMixerHooks);
     QAVMarkMixerActive();
 }
@@ -342,7 +399,7 @@ static void QAVHookEngine(void) {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel *title = [UILabel new];
-    title.text = @"App 独立音量 · 0.3";
+    title.text = @"App 独立音量 · 0.4";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     UILabel *app = [UILabel new];
     app.text = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: NSBundle.mainBundle.bundleIdentifier;
@@ -366,7 +423,7 @@ static void QAVHookEngine(void) {
     self.diagnostics.textColor = UIColor.secondaryLabelColor;
     self.diagnostics.numberOfLines = 0;
     UILabel *help = [UILabel new];
-    help.text = @"三指双击打开此面板。设置仅保存在当前 App 内；100% 保留播放器原音量，0% 静音。覆盖 AVPlayer、AVAudioPlayer、AVAudioPlayerNode、AVSampleBufferAudioRenderer、AudioQueue 与 AVAudioEngine 混音器。不改变系统音量或后台播放策略。";
+    help.text = @"三指双击打开此面板。设置仅保存在当前 App 内；100% 保留播放器原音量，0% 静音。覆盖 AVPlayer、AVAudioPlayer、AVAudioPlayerNode、AVSampleBufferAudioRenderer、AudioQueue、AVAudioEngine 混音器，以及 App 自己启动的 RemoteIO 渲染缓冲。不改变系统音量或后台播放策略。";
     help.numberOfLines = 0;
     help.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     help.textColor = UIColor.secondaryLabelColor;
@@ -415,36 +472,66 @@ static void QAVHookEngine(void) {
 - (void)settingsChanged:(NSNotification *)notification {
     [self refresh];
 }
+- (NSString *)mixerSummaryLockedRead {
+    [QAVLock lock];
+    BOOL active = QAVMixerRegistered;
+    NSUInteger writes = QAVMixerWrites;
+    float requested = QAVMixerRequested;
+    float applied = QAVMixerApplied;
+    NSString *className = QAVMixerClassName.copy;
+    [QAVLock unlock];
+    if (!active) return @"未接管";
+    return [NSString stringWithFormat:@"%@：已接管，写入 %lu 次，最近请求 %.3f → 落地 %.3f", className ?: @"未知类", (unsigned long)writes, requested, applied];
+}
+- (NSString *)setterHitSummary {
+    [QAVLock lock];
+    NSArray<NSString *> *names = @[ @"AVPlayer", @"AVAudioPlayer", @"AVAudioPlayerNode", @"AVSampleBufferAudioRenderer", @"AVAudioMixerNode" ];
+    NSMutableArray<NSString *> *parts = [NSMutableArray new];
+    for (NSString *name in names) [parts addObject:[NSString stringWithFormat:@"%@:%@", name, QAVSetterHits[name] ?: @"0"]];
+    [QAVLock unlock];
+    return [parts componentsJoinedByString:@" "];
+}
 - (void)refreshDiagnostics {
     [QAVLock lock];
     NSUInteger count = QAVPlayers.allObjects.count;
-    BOOL mixerActive = QAVMixerRegistered;
     [QAVLock unlock];
+    QAVAudioUnitRefresh();
     QAVAudioQueueDiagnostics queues = QAVAudioQueueGetDiagnostics();
     QAVAudioUnitDiagnostics units = QAVAudioUnitGetDiagnostics();
     char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
     QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
-    self.diagnostics.text = [NSString stringWithFormat:@"AVFoundation：%lu 个\nAVAudioEngine 混音器：%@\nAudioQueue：%llu 个（累计 %llu）\n队列音量应用：%llu 次\nAudioUnit：挂载 %llu / 卸载 %llu，缩放 %llu 帧\n输入侧帧数：%llu，格式不支持：%llu\n单元格式：%u bit %@，%u 声道，最近 bus %d，错误 %d\n已扫描应用模块：%llu / 已见模块：%llu\n模块拦截状态：%d（errno %d，错误 %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染时生效。",
+    self.diagnostics.text = [NSString stringWithFormat:
+        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n喇叭格式：status %d，%u bit %@，%u 声道\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，不认识格式 %llu，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
         (unsigned long)count,
-        mixerActive ? @"已接管（节点音量不再重复衰减）" : @"未接管",
+        [self setterHitSummary],
+        [self mixerSummaryLockedRead],
         (unsigned long long)queues.activeQueues,
         (unsigned long long)queues.createdQueues,
         (unsigned long long)queues.appliedChanges,
+        queues.lastError,
         (unsigned long long)units.attachedUnits,
         (unsigned long long)units.detachedUnits,
         (unsigned long long)units.scaledFrames,
-        (unsigned long long)units.inputFramesSeen,
+        (unsigned long long)units.skippedFrames,
+        (unsigned long long)units.geometryMismatches,
+        (unsigned long long)units.framesPerBus[0],
+        (unsigned long long)units.framesPerBus[1],
+        (unsigned long long)units.framesPerBus[2],
+        (unsigned long long)units.framesPerBus[3],
+        units.speakerFormatStatus,
+        units.speakerBitsPerChannel,
+        units.speakerIsFloat ? @"浮点" : @"整型",
+        units.speakerChannels,
+        units.micFormatStatus,
+        units.micBitsPerChannel,
+        units.speakerIO,
+        units.micIO,
         (unsigned long long)units.formatFailures,
-        units.lastBitsPerChannel,
-        units.lastIsFloat ? @"浮点" : @"整型",
-        units.lastChannels,
-        units.lastBusNumber,
         units.lastError,
         (unsigned long long)queues.scannedImages,
         (unsigned long long)queues.seenImages,
         queues.installStatus,
         queues.installErrno,
-        queues.lastError,
         @(bundle),
         @(image)];
 }
@@ -551,6 +638,8 @@ __attribute__((constructor)) static void QAVInitialize(void) {
         if ([bundle.bundleIdentifier isEqualToString:@"com.apple.springboard"] || [bundle.bundlePath.pathExtension isEqualToString:@"appex"]) return;
         QAVLock = [NSRecursiveLock new];
         QAVPlayers = [NSHashTable weakObjectsHashTable];
+        QAVInstalledIMPs = [NSMutableSet set];
+        QAVSetterHits = [NSMutableDictionary dictionary];
         QAVPreferenceKey = [@"io.coyote.AppVolume.settings." stringByAppendingString:bundle.bundleIdentifier ?: @"main"];
         id saved = [[NSUserDefaults standardUserDefaults] objectForKey:QAVPreferenceKey];
         if ([saved isKindOfClass:NSDictionary.class]) {
