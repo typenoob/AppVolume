@@ -399,7 +399,7 @@ static void QAVHookEngine(void) {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel *title = [UILabel new];
-    title.text = @"App 独立音量 · 0.4";
+    title.text = @"App 独立音量 · 0.4.1";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     UILabel *app = [UILabel new];
     app.text = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: NSBundle.mainBundle.bundleIdentifier;
@@ -491,6 +491,19 @@ static void QAVHookEngine(void) {
     [QAVLock unlock];
     return [parts componentsJoinedByString:@" "];
 }
+// One line per candidate the speaker stream could be, with how many frames each actually scaled: when 缓冲不符
+// climbs, the observed render geometry printed next to these candidates shows which assumption is wrong.
+- (NSString *)candidateSummary:(QAVAudioUnitDiagnostics)units {
+    if (!units.candidateCount) return @"无（未认出喇叭格式）";
+    NSMutableArray<NSString *> *parts = [NSMutableArray new];
+    for (uint32_t index = 0; index < units.candidateCount && index < QAV_AUDIO_UNIT_CANDIDATES; index++) {
+        [parts addObject:[NSString stringWithFormat:@"c%u %uB/帧 %u bit %@，缩放 %llu 帧",
+            index, units.candidateBytesPerFrame[index], units.candidateBits[index],
+            units.candidateIsFloat[index] ? @"浮点" : @"整型",
+            (unsigned long long)units.framesPerCandidate[index]]];
+    }
+    return [parts componentsJoinedByString:@"；"];
+}
 - (void)refreshDiagnostics {
     [QAVLock lock];
     NSUInteger count = QAVPlayers.allObjects.count;
@@ -501,7 +514,7 @@ static void QAVHookEngine(void) {
     char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
     QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
     self.diagnostics.text = [NSString stringWithFormat:
-        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n喇叭格式：status %d，%u bit %@，%u 声道\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，不认识格式 %llu，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
+        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n候选格式：%@\n实测渲染：%u 帧 / %u 字节 / %u 个缓冲\n喇叭输入格式：%u 声道，%u B/帧（status %d）\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，不认识格式 %llu，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
         (unsigned long)count,
         [self setterHitSummary],
         [self mixerSummaryLockedRead],
@@ -518,10 +531,13 @@ static void QAVHookEngine(void) {
         (unsigned long long)units.framesPerBus[1],
         (unsigned long long)units.framesPerBus[2],
         (unsigned long long)units.framesPerBus[3],
-        units.speakerFormatStatus,
-        units.speakerBitsPerChannel,
-        units.speakerIsFloat ? @"浮点" : @"整型",
+        [self candidateSummary:units],
+        units.renderFrames,
+        units.renderBytes,
+        units.renderBuffers,
         units.speakerChannels,
+        units.speakerBytesPerFrame,
+        units.speakerFormatStatus,
         units.micFormatStatus,
         units.micBitsPerChannel,
         units.speakerIO,
