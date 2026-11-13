@@ -1,5 +1,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
+#import <limits.h>
 #import <objc/runtime.h>
 #import "VolumePolicy.h"
 #import "AudioQueueVolume.h"
@@ -21,21 +22,35 @@ typedef float (*QAVGetVolumeIMP)(id, SEL);
 typedef void (*QAVFadeVolumeIMP)(id, SEL, float, NSTimeInterval);
 static QAVFadeVolumeIMP QAVAudioPlayerFade;
 
+// One class' volume accessors. AVAudioMixerNode uses outputVolume, the rest use volume.
+typedef struct {
+    QAVSetVolumeIMP setter;
+    QAVGetVolumeIMP getter;
+    SEL setSelector;
+    SEL getSelector;
+    // Engine nodes route through the mixer, which already carries the gain.
+    BOOL defersToMixer;
+} QAVVolumeHooks;
+
+static QAVVolumeHooks QAVMixerHooks;
+static BOOL QAVMixerHooksAvailable;
+static BOOL QAVMixerRegistered;
+
 @interface QAVPlayerState : NSObject
 @property(nonatomic) QAVVolumePolicy policy;
-@property(nonatomic) QAVSetVolumeIMP setter;
+@property(nonatomic) QAVVolumeHooks hooks;
 @property(nonatomic) QAVFadeVolumeIMP fader;
 @property(nonatomic) NSUInteger revision;
 @end
 @implementation QAVPlayerState
 @end
 
-static QAVPlayerState *QAVRegisterLocked(id player, QAVSetVolumeIMP setter, float base) {
+static QAVPlayerState *QAVRegisterLocked(id player, QAVVolumeHooks hooks, float base) {
     QAVPlayerState *state = objc_getAssociatedObject(player, &QAVStateKey);
     if (!state) {
         state = [QAVPlayerState new];
         state.policy = (QAVVolumePolicy){ .requestedVolume = base };
-        state.setter = setter;
+        state.hooks = hooks;
         if ([player isKindOfClass:AVAudioPlayer.class]) state.fader = QAVAudioPlayerFade;
         objc_setAssociatedObject(player, &QAVStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [QAVPlayers addObject:player];
@@ -48,21 +63,28 @@ static void QAVApplyLatest(id player) {
         [QAVLock lock];
         QAVPlayerState *state = objc_getAssociatedObject(player, &QAVStateKey);
         QAVVolumePolicy policy = state.policy;
-        QAVSetVolumeIMP setter = state.setter;
+        QAVVolumeHooks hooks = state.hooks;
         QAVFadeVolumeIMP fader = state.fader;
         NSUInteger revision = state.revision;
         NSUInteger generation = QAVGeneration;
         float gain = QAVGain;
         BOOL enabled = QAVEnabled;
+        BOOL defers = hooks.defersToMixer && QAVMixerRegistered;
         [QAVLock unlock];
+        if (!state) return;
 
         double now = NSProcessInfo.processInfo.systemUptime;
+        double remaining = QAVRemainingFade(policy, now);
         QAVInternalVolumeWrite++;
         @try {
-            setter(player, @selector(setVolume:), QAVScaleVolume(QAVRequestedVolumeAt(policy, now), gain, enabled));
-            double remaining = QAVRemainingFade(policy, now);
-            if (fader && remaining > 0.0) {
-                fader(player, @selector(setVolume:fadeDuration:), QAVEffectiveVolume(policy, gain, enabled), remaining);
+            if (defers) {
+                // The mixer applies the gain for the whole graph; writing it twice would square it.
+                hooks.setter(player, hooks.setSelector, QAVRequestedVolumeAt(policy, now));
+            } else {
+                hooks.setter(player, hooks.setSelector, QAVScaleVolume(QAVRequestedVolumeAt(policy, now), gain, enabled));
+                if (fader && remaining > 0.0) {
+                    fader(player, @selector(setVolume:fadeDuration:), QAVEffectiveVolume(policy, gain, enabled), remaining);
+                }
             }
         } @finally {
             QAVInternalVolumeWrite--;
@@ -76,28 +98,34 @@ static void QAVApplyLatest(id player) {
     }
 }
 
+static void QAVReapplyAll(void) {
+    [QAVLock lock];
+    NSArray *players = QAVPlayers.allObjects;
+    [QAVLock unlock];
+    for (id player in players) QAVApplyLatest(player);
+}
+
 static void QAVUpdate(float gain, BOOL enabled) {
     gain = QAVNormalizeGain(gain);
     [QAVLock lock];
     QAVGain = gain;
     QAVEnabled = enabled;
     QAVGeneration++;
-    NSArray *players = QAVPlayers.allObjects;
     [QAVLock unlock];
     QAVAudioQueueSetGain(gain, enabled);
-    for (id player in players) QAVApplyLatest(player);
+    QAVReapplyAll();
     [[NSUserDefaults standardUserDefaults] setObject:@{@"gain": @(gain), @"enabled": @(enabled)} forKey:QAVPreferenceKey];
     [NSNotificationCenter.defaultCenter postNotificationName:QAVSettingsChanged object:nil];
 }
 
-static void QAVPreparePlayback(id player, QAVSetVolumeIMP setter, QAVGetVolumeIMP getter) {
+static void QAVPreparePlayback(id player, QAVVolumeHooks hooks) {
     [QAVLock lock];
     BOOL registered = objc_getAssociatedObject(player, &QAVStateKey) != nil;
     [QAVLock unlock];
     if (registered) return;
-    float base = getter(player, @selector(volume));
+    float base = hooks.getter(player, hooks.getSelector);
     [QAVLock lock];
-    QAVRegisterLocked(player, setter, base);
+    QAVRegisterLocked(player, hooks, base);
     [QAVLock unlock];
     QAVApplyLatest(player);
 }
@@ -109,68 +137,91 @@ static void QAVReplace(Class cls, SEL selector, IMP replacement) {
     }
 }
 
-static void QAVHookVoidTransport(Class cls, SEL selector, QAVSetVolumeIMP setter, QAVGetVolumeIMP getter) {
+static void QAVHookVoidTransport(Class cls, SEL selector, QAVVolumeHooks hooks) {
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) return;
     void (*original)(id, SEL) = (void *)method_getImplementation(method);
     QAVReplace(cls, selector, imp_implementationWithBlock(^(id player) {
-        if (!QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+        if (!QAVTransportDepth) QAVPreparePlayback(player, hooks);
         QAVTransportDepth++;
         @try { original(player, selector); }
         @finally { QAVTransportDepth--; }
     }));
 }
 
-static void QAVHookObjectTransport(Class cls, SEL selector, QAVSetVolumeIMP setter, QAVGetVolumeIMP getter) {
+static void QAVHookObjectTransport(Class cls, SEL selector, QAVVolumeHooks hooks) {
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) return;
     void (*original)(id, SEL, id) = (void *)method_getImplementation(method);
     QAVReplace(cls, selector, imp_implementationWithBlock(^(id player, id argument) {
-        if (!QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+        if (!QAVTransportDepth) QAVPreparePlayback(player, hooks);
         QAVTransportDepth++;
         @try { original(player, selector, argument); }
         @finally { QAVTransportDepth--; }
     }));
 }
 
-static void QAVHookClass(NSString *name) {
+static void QAVMarkMixerActive(void) {
+    [QAVLock lock];
+    BOOL firstTime = !QAVMixerRegistered;
+    QAVMixerRegistered = YES;
+    if (firstTime) QAVGeneration++;
+    [QAVLock unlock];
+    // Nodes that were carrying the gain themselves must hand it back to the mixer.
+    if (firstTime) QAVReapplyAll();
+}
+
+static void QAVHookClass(NSString *name, SEL setVolumeSelector, SEL getVolumeSelector) {
     Class cls = NSClassFromString(name);
-    Method setMethod = class_getInstanceMethod(cls, @selector(setVolume:));
-    Method getMethod = class_getInstanceMethod(cls, @selector(volume));
+    Method setMethod = class_getInstanceMethod(cls, setVolumeSelector);
+    Method getMethod = class_getInstanceMethod(cls, getVolumeSelector);
     if (!setMethod || !getMethod) return;
-    QAVSetVolumeIMP setter = (void *)method_getImplementation(setMethod);
-    QAVGetVolumeIMP getter = (void *)method_getImplementation(getMethod);
+    BOOL isMixer = [name isEqualToString:@"AVAudioMixerNode"];
+    QAVVolumeHooks hooks = {
+        .setter = (void *)method_getImplementation(setMethod),
+        .getter = (void *)method_getImplementation(getMethod),
+        .setSelector = setVolumeSelector,
+        .getSelector = getVolumeSelector,
+        .defersToMixer = [name isEqualToString:@"AVAudioPlayerNode"]
+    };
+    if (isMixer) {
+        QAVMixerHooks = hooks;
+        QAVMixerHooksAvailable = YES;
+    }
     if ([name isEqualToString:@"AVAudioPlayer"]) {
         QAVAudioPlayerFade = (void *)class_getMethodImplementation(cls, @selector(setVolume:fadeDuration:));
     }
 
-    QAVReplace(cls, @selector(setVolume:), imp_implementationWithBlock(^(id player, float volume) {
+    QAVReplace(cls, setVolumeSelector, imp_implementationWithBlock(^(id player, float volume) {
         if (QAVInternalVolumeWrite) {
-            setter(player, @selector(setVolume:), volume);
+            hooks.setter(player, setVolumeSelector, volume);
             return;
         }
         [QAVLock lock];
-        QAVPlayerState *state = QAVRegisterLocked(player, setter, volume);
+        QAVPlayerState *state = QAVRegisterLocked(player, hooks, volume);
         state.policy = (QAVVolumePolicy){ .requestedVolume = volume };
         state.revision++;
         [QAVLock unlock];
         QAVApplyLatest(player);
+        if (isMixer) QAVMarkMixerActive();
     }));
 
-    QAVReplace(cls, @selector(volume), imp_implementationWithBlock(^float(id player) {
-        if (QAVInternalVolumeWrite) return getter(player, @selector(volume));
+    QAVReplace(cls, getVolumeSelector, imp_implementationWithBlock(^float(id player) {
+        if (QAVInternalVolumeWrite) return hooks.getter(player, getVolumeSelector);
         [QAVLock lock];
         QAVPlayerState *state = objc_getAssociatedObject(player, &QAVStateKey);
         QAVVolumePolicy policy = state.policy;
         [QAVLock unlock];
-        return state ? QAVRequestedVolumeAt(policy, NSProcessInfo.processInfo.systemUptime) : getter(player, @selector(volume));
+        return state ? QAVRequestedVolumeAt(policy, NSProcessInfo.processInfo.systemUptime) : hooks.getter(player, getVolumeSelector);
     }));
+
+    if (isMixer) return;
 
     if ([name isEqualToString:@"AVAudioPlayer"]) {
         SEL play = @selector(play);
         BOOL (*originalPlay)(id, SEL) = (void *)class_getMethodImplementation(cls, play);
         QAVReplace(cls, play, imp_implementationWithBlock(^BOOL(id player) {
-            if (!QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+            if (!QAVTransportDepth) QAVPreparePlayback(player, hooks);
             QAVTransportDepth++;
             @try { return originalPlay(player, play); }
             @finally { QAVTransportDepth--; }
@@ -178,7 +229,7 @@ static void QAVHookClass(NSString *name) {
         SEL timedPlay = @selector(playAtTime:);
         BOOL (*originalTimedPlay)(id, SEL, NSTimeInterval) = (void *)class_getMethodImplementation(cls, timedPlay);
         QAVReplace(cls, timedPlay, imp_implementationWithBlock(^BOOL(id player, NSTimeInterval time) {
-            if (!QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+            if (!QAVTransportDepth) QAVPreparePlayback(player, hooks);
             QAVTransportDepth++;
             @try { return originalTimedPlay(player, timedPlay, time); }
             @finally { QAVTransportDepth--; }
@@ -190,7 +241,7 @@ static void QAVHookClass(NSString *name) {
                 originalFade(player, fade, volume, duration);
                 return;
             }
-            QAVPreparePlayback(player, setter, getter);
+            QAVPreparePlayback(player, hooks);
             double now = NSProcessInfo.processInfo.systemUptime;
             [QAVLock lock];
             QAVPlayerState *state = objc_getAssociatedObject(player, &QAVStateKey);
@@ -203,22 +254,22 @@ static void QAVHookClass(NSString *name) {
         SEL enqueue = @selector(enqueueSampleBuffer:);
         void (*original)(id, SEL, CMSampleBufferRef) = (void *)class_getMethodImplementation(cls, enqueue);
         QAVReplace(cls, enqueue, imp_implementationWithBlock(^(id player, CMSampleBufferRef buffer) {
-            if (!QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+            if (!QAVTransportDepth) QAVPreparePlayback(player, hooks);
             QAVTransportDepth++;
             @try { original(player, enqueue, buffer); }
             @finally { QAVTransportDepth--; }
         }));
     } else {
-        QAVHookVoidTransport(cls, @selector(play), setter, getter);
+        QAVHookVoidTransport(cls, @selector(play), hooks);
         if ([name isEqualToString:@"AVAudioPlayerNode"]) {
-            QAVHookObjectTransport(cls, @selector(playAtTime:), setter, getter);
+            QAVHookObjectTransport(cls, @selector(playAtTime:), hooks);
         } else {
             SEL timedRate = @selector(setRate:time:atHostTime:);
             Method timedMethod = class_getInstanceMethod(cls, timedRate);
             if (timedMethod) {
                 void (*originalTimedRate)(id, SEL, float, CMTime, CMTime) = (void *)method_getImplementation(timedMethod);
                 QAVReplace(cls, timedRate, imp_implementationWithBlock(^(id player, float rate, CMTime time, CMTime hostTime) {
-                    if (rate != 0.0f && !QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+                    if (rate != 0.0f && !QAVTransportDepth) QAVPreparePlayback(player, hooks);
                     QAVTransportDepth++;
                     @try { originalTimedRate(player, timedRate, rate, time, hostTime); }
                     @finally { QAVTransportDepth--; }
@@ -230,13 +281,49 @@ static void QAVHookClass(NSString *name) {
                 if (!method) continue;
                 void (*original)(id, SEL, float) = (void *)method_getImplementation(method);
                 QAVReplace(cls, selector, imp_implementationWithBlock(^(id player, float rate) {
-                    if (rate != 0.0f && !QAVTransportDepth) QAVPreparePlayback(player, setter, getter);
+                    if (rate != 0.0f && !QAVTransportDepth) QAVPreparePlayback(player, hooks);
                     QAVTransportDepth++;
                     @try { original(player, selector, rate); }
                     @finally { QAVTransportDepth--; }
                 }));
             }
         }
+    }
+}
+
+static void QAVAdoptEngineMixer(id engine) {
+    AVAudioNode *mixer = [(AVAudioEngine *)engine mainMixerNode];
+    if (!mixer) return;
+    QAVPreparePlayback(mixer, QAVMixerHooks);
+    QAVMarkMixerActive();
+}
+
+// An engine that never writes outputVolume still mixes through mainMixerNode, so claim it as the boundary at start.
+static void QAVHookEngine(void) {
+    if (!QAVMixerHooksAvailable) return;
+    Class cls = NSClassFromString(@"AVAudioEngine");
+    if (!cls) return;
+    SEL start = @selector(startAndReturnError:);
+    Method startMethod = class_getInstanceMethod(cls, start);
+    if (startMethod) {
+        BOOL (*original)(id, SEL, NSError **) = (void *)method_getImplementation(startMethod);
+        QAVReplace(cls, start, imp_implementationWithBlock(^BOOL(id engine, NSError **error) {
+            if (!QAVTransportDepth) QAVAdoptEngineMixer(engine);
+            QAVTransportDepth++;
+            @try { return original(engine, start, error); }
+            @finally { QAVTransportDepth--; }
+        }));
+    }
+    SEL prepare = @selector(prepare);
+    Method prepareMethod = class_getInstanceMethod(cls, prepare);
+    if (prepareMethod) {
+        void (*original)(id, SEL) = (void *)method_getImplementation(prepareMethod);
+        QAVReplace(cls, prepare, imp_implementationWithBlock(^(id engine) {
+            if (!QAVTransportDepth) QAVAdoptEngineMixer(engine);
+            QAVTransportDepth++;
+            @try { original(engine, prepare); }
+            @finally { QAVTransportDepth--; }
+        }));
     }
 }
 
@@ -253,7 +340,7 @@ static void QAVHookClass(NSString *name) {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel *title = [UILabel new];
-    title.text = @"App 独立音量 · 0.2";
+    title.text = @"App 独立音量 · 0.3";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     UILabel *app = [UILabel new];
     app.text = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: NSBundle.mainBundle.bundleIdentifier;
@@ -277,7 +364,7 @@ static void QAVHookClass(NSString *name) {
     self.diagnostics.textColor = UIColor.secondaryLabelColor;
     self.diagnostics.numberOfLines = 0;
     UILabel *help = [UILabel new];
-    help.text = @"三指双击打开此面板。设置仅保存在当前 App 内；100% 保留播放器原音量，0% 静音。不改变系统音量或后台播放策略。";
+    help.text = @"三指双击打开此面板。设置仅保存在当前 App 内；100% 保留播放器原音量，0% 静音。覆盖 AVPlayer、AVAudioPlayer、AVAudioPlayerNode、AVSampleBufferAudioRenderer、AudioQueue 与 AVAudioEngine 混音器。不改变系统音量或后台播放策略。";
     help.numberOfLines = 0;
     help.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     help.textColor = UIColor.secondaryLabelColor;
@@ -329,9 +416,24 @@ static void QAVHookClass(NSString *name) {
 - (void)refreshDiagnostics {
     [QAVLock lock];
     NSUInteger count = QAVPlayers.allObjects.count;
+    BOOL mixerActive = QAVMixerRegistered;
     [QAVLock unlock];
     QAVAudioQueueDiagnostics queues = QAVAudioQueueGetDiagnostics();
-    self.diagnostics.text = [NSString stringWithFormat:@"AVFoundation：%lu 个\nAudioQueue：%llu 个（累计 %llu）\n队列音量应用：%llu 次，状态：%d\n已扫描应用模块：%llu\nAudioQueue 设置在下一次送入音频缓冲时生效。", (unsigned long)count, (unsigned long long)queues.activeQueues, (unsigned long long)queues.createdQueues, (unsigned long long)queues.appliedChanges, queues.lastError, (unsigned long long)queues.scannedImages];
+    char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
+    QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
+    self.diagnostics.text = [NSString stringWithFormat:@"AVFoundation：%lu 个\nAVAudioEngine 混音器：%@\nAudioQueue：%llu 个（累计 %llu）\n队列音量应用：%llu 次\n已扫描应用模块：%llu / 已见模块：%llu\n模块拦截状态：%d（errno %d，错误 %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染时生效。",
+        (unsigned long)count,
+        mixerActive ? @"已接管（节点音量不再重复衰减）" : @"未接管",
+        (unsigned long long)queues.activeQueues,
+        (unsigned long long)queues.createdQueues,
+        (unsigned long long)queues.appliedChanges,
+        (unsigned long long)queues.scannedImages,
+        (unsigned long long)queues.seenImages,
+        queues.installStatus,
+        queues.installErrno,
+        queues.lastError,
+        @(bundle),
+        @(image)];
 }
 - (void)refresh {
     [QAVLock lock];
@@ -444,9 +546,13 @@ __attribute__((constructor)) static void QAVInitialize(void) {
             if ([gain isKindOfClass:NSNumber.class]) QAVGain = QAVNormalizeGain([gain floatValue]);
             if ([enabled isKindOfClass:NSNumber.class]) QAVEnabled = [enabled boolValue];
         }
-        for (NSString *name in @[@"AVPlayer", @"AVAudioPlayer", @"AVAudioPlayerNode", @"AVSampleBufferAudioRenderer"]) {
-            QAVHookClass(name);
-        }
+        SEL volume = @selector(volume);
+        QAVHookClass(@"AVPlayer", @selector(setVolume:), volume);
+        QAVHookClass(@"AVAudioPlayer", @selector(setVolume:), volume);
+        QAVHookClass(@"AVAudioPlayerNode", @selector(setVolume:), volume);
+        QAVHookClass(@"AVSampleBufferAudioRenderer", @selector(setVolume:), volume);
+        QAVHookClass(@"AVAudioMixerNode", @selector(setOutputVolume:), @selector(outputVolume));
+        QAVHookEngine();
         QAVAudioQueueInstall(bundle.bundlePath.fileSystemRepresentation, QAVGain, QAVEnabled);
         dispatch_async(dispatch_get_main_queue(), ^{
             static QAVUIManager *manager;

@@ -6,8 +6,10 @@
 #include <string.h>
 #ifndef QAV_AUDIOQUEUE_TEST
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <stdio.h>
 #include "../vendor/fishhook/fishhook.h"
 #endif
 
@@ -200,14 +202,28 @@ QAVAudioQueueDiagnostics QAVAudioQueueGetDiagnostics(void) {
 
 #ifndef QAV_AUDIOQUEUE_TEST
 static char QAVBundlePath[PATH_MAX];
+static char QAVFirstImage[PATH_MAX];
 static const void *QAVOwnImage;
 
-static void QAVRebindQueueImage(const struct mach_header *header, intptr_t slide) {
+static void QAVSetInstallState(int status, int code) {
+    pthread_mutex_lock(&QAVQueueLock);
+    QAVQueueDiagnostics.installStatus = status;
+    QAVQueueDiagnostics.installErrno = code;
+    pthread_mutex_unlock(&QAVQueueLock);
+}
+
+static void QAVRecordSeenImage(const char *path) {
+    pthread_mutex_lock(&QAVQueueLock);
+    if (!QAVQueueDiagnostics.seenImages) snprintf(QAVFirstImage, sizeof(QAVFirstImage), "%s", path);
+    QAVQueueDiagnostics.seenImages++;
+    pthread_mutex_unlock(&QAVQueueLock);
+}
+
+static void QAVBindQueueImage(const struct mach_header *header, intptr_t slide, const char *name) {
     if ((const void *)header == QAVOwnImage) return;
-    Dl_info info;
-    if (!dladdr(header, &info) || !info.dli_fname) return;
     char path[PATH_MAX];
-    if (!realpath(info.dli_fname, path)) return;
+    if (!name || !realpath(name, path)) return;
+    QAVRecordSeenImage(path);
     size_t prefixLength = strlen(QAVBundlePath);
     if (strncmp(path, QAVBundlePath, prefixLength) != 0 || path[prefixLength] != '/') return;
     // System frameworks and this dylib retain their native calls, avoiding recursive or double attenuation.
@@ -226,23 +242,60 @@ static void QAVRebindQueueImage(const struct mach_header *header, intptr_t slide
     if (result != 0) QAVQueueDiagnostics.lastError = result;
     pthread_mutex_unlock(&QAVQueueLock);
 }
+
+static void QAVRebindQueueImage(const struct mach_header *header, intptr_t slide) {
+    Dl_info info;
+    if (!dladdr(header, &info)) return;
+    QAVBindQueueImage(header, slide, info.dli_fname);
+}
+
+// Our constructor runs after the app binary and its frameworks are already mapped, so bind them directly
+// instead of relying on the add-image notification replaying them.
+static void QAVBindLoadedImages(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t index = 0; index < count; index++) {
+        const struct mach_header *header = _dyld_get_image_header(index);
+        if (header) QAVBindQueueImage(header, _dyld_get_image_vmaddr_slide(index), _dyld_get_image_name(index));
+    }
+}
 #endif
 
 void QAVAudioQueueInstall(const char *appBundlePath, float gain, bool enabled) {
     QAVAudioQueueSetGain(gain, enabled);
 #ifndef QAV_AUDIOQUEUE_TEST
-    if (!appBundlePath || !realpath(appBundlePath, QAVBundlePath)) {
+    Dl_info ownInfo;
+    if (!appBundlePath) {
+        QAVSetInstallState(-1, 0);
         QAVRecordQueueError(-50);
         return;
     }
-    Dl_info ownInfo;
+    if (!realpath(appBundlePath, QAVBundlePath)) {
+        QAVSetInstallState(-2, errno);
+        QAVRecordQueueError(-50);
+        return;
+    }
     if (!dladdr((void *)QAVAudioQueueInstall, &ownInfo)) {
+        QAVSetInstallState(-3, 0);
         QAVRecordQueueError(-50);
         return;
     }
     QAVOwnImage = ownInfo.dli_fbase;
+    QAVBindLoadedImages();
+    QAVSetInstallState(1, 0);
     _dyld_register_func_for_add_image(QAVRebindQueueImage);
 #else
     (void)appBundlePath;
 #endif
+}
+
+void QAVAudioQueueCopyPaths(char *bundle, size_t bundleSize, char *image, size_t imageSize) {
+    pthread_mutex_lock(&QAVQueueLock);
+#ifndef QAV_AUDIOQUEUE_TEST
+    if (bundle && bundleSize) snprintf(bundle, bundleSize, "%s", QAVBundlePath);
+    if (image && imageSize) snprintf(image, imageSize, "%s", QAVFirstImage);
+#else
+    if (bundle && bundleSize) bundle[0] = '\0';
+    if (image && imageSize) image[0] = '\0';
+#endif
+    pthread_mutex_unlock(&QAVQueueLock);
 }
