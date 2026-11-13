@@ -31,7 +31,7 @@
 - **Audio Unit 只缩放 0 号 bus**：RemoteIO 的编号和普通 Audio Unit 相反 —— `AudioUnitProperties.h` 里写的是「scope output, element 0 = output」「scope input, element 1 = input」，aurioTouch 也据此定义 `kOutputBus = 0`、`kInputBus = 1`。所以扬声器是 0 号 bus，1 号 bus 是采集侧，录音/连麦的电平保持 App 自己的值。v0.3 把这条写反了，导致缩放帧数恒为 0。
 - **AudioQueue 增益有延迟**：改动在下一次 `AudioQueueStart` 或送入音频缓冲时才下发到原生队列，不是即时生效。
 - **混音器是唯一边界**：一旦接管了某个 `AVAudioEngine` 的 `mainMixerNode`，同一引擎里的 `AVAudioPlayerNode.volume` 就只转发原始请求值、不再重复缩放，避免增益被平方。代价是：若 App 用同一引擎把音频渲染到文件（录音/导出），导出结果也会带上该增益。
-- **真机验证情况**：编译、Mach-O 签名校验和音量策略的单元测试已通过。v0.2/v0.3/v0.4/v0.4.1/v0.4.2/v0.4.3 已在真机注入实测：v0.3 的「单元挂上了、渲染帧数在涨但音量不变」查出 bus 判定写反；v0.4 修正 bus 后抖音短视频改为「缓冲不符」计数上涨，v0.4.1 的候选匹配把它修好了（短视频已确认可调，实测为 float32 立体声非交织、1024 帧量子）；v0.4.2 的直播读数确认直播那个 RemoteIO 是 `'auou'/'rioc'`、在 bundle 镜像里创建；v0.4.3 的直播读数 `EnableIO 输出0 输入1`、`格式写入 5 次` 说明面板当时描述的更可能是采集那一半（见「直播间仍未生效」）。**仍未解决的**：抖音直播间与 ManicEMU（待面板里的混音器接管与「请求 → 落地」两行读数）。v0.4.4 只做诊断改造：Audio Unit 按单元逐行输出，0 号 bus 的渲染次数与缓冲几何无条件记录，用来一次复测就把「播放单元没挂上」「挂了但 0 号 bus 不渲染」「描述的是采集单元」三种可能分开。
+- **真机验证情况**：编译、Mach-O 签名校验和音量策略的单元测试已通过。v0.2/v0.3/v0.4/v0.4.1/v0.4.2/v0.4.3 已在真机注入实测：v0.3 的「单元挂上了、渲染帧数在涨但音量不变」查出 bus 判定写反；v0.4 修正 bus 后抖音短视频改为「缓冲不符」计数上涨，v0.4.1 的候选匹配把它修好了（短视频已确认可调，实测为 float32 立体声非交织、1024 帧量子）；v0.4.2 的直播读数确认直播那个 RemoteIO 是 `'auou'/'rioc'`、在 bundle 镜像里创建；v0.4.3 的直播读数 `EnableIO 输出0 输入1`、`格式写入 5 次` 说明面板当时描述的更可能是采集那一半（见「直播间仍未生效」）。**仍未解决的**：只剩抖音直播间。v0.4.4 只做诊断改造：Audio Unit 按单元逐行输出，0 号 bus 的渲染次数与缓冲几何无条件记录，用来一次复测就把「播放单元没挂上」「挂了但 0 号 bus 不渲染」「描述的是采集单元」三种可能分开。**ManicEMU 已真机确认可调**（0.4.x 复测；哪一次改动使其生效未单独回归，见「适配 ManicEMU」）。
 
 ## 构建
 
@@ -58,7 +58,8 @@ SDKROOT=/path/to/iPhoneOS.sdk bash build.sh
 - 面板计数为 0 是预期现象，不是注入失败：DeltaCore 的 `AudioManager` 走 `AVAudioEngine` + `AVAudioSourceNode` → `AVAudioUnitTimePitch` → `mainMixerNode`，音量只体现在 `mainMixerNode.outputVolume` 上。
 - 静态分析（v2.0.2 SideloadJIT，arm64 主二进制）确认导入的音频类只有 `AVAudioEngine`/`AVAudioPlayerNode`/`AVAudioSourceNode`/`AVAudioUnitTimePitch`/`AVAudioConverter`/`AVAudioPlayer`/`AVPlayer`，`__objc_methname` 里存在 `setOutputVolume:` 与 `mainMixerNode`，全 App 没有任何 `AudioQueue*` 符号 —— 42 个 `libretro.framework` 核心只导出 `retro_set_audio_sample*`，采样最终由 Swift 侧灌进引擎。
 - 因此本版的混音器接管即为该 App 的缩放点；`AudioManager` 自己写的 0.0（静音/其他 App 正在播放）与 1.0 都作为「请求音量」记录，缩放后仍然保留其静音语义。
-- v0.3 真机仍然听不到衰减，所以本版把判据搬上面板，三种结果对应三种改法：`音量写入 AVAudioMixerNode:0` 说明写入根本没经过我们 hook 的那个类；`已接管 <真实类名>，写入 N 次，请求 0.60 → 落地 1.00` 说明我们写下的值没被这个对象接受；`请求 0.60 → 落地 0.60` 而音量照旧，才说明混音器不是它的缩放点（那就得往引擎的输出节点方向找）。
+- **复测确认：ManicEMU 已可调**（真机，0.4.x 系列）。**注意这是结果确认，不是定位结论**：0.4 的发布说明里还写着「ManicEMU 失败原因未定」，其后 0.4.1 改了 bus 判定与候选匹配、0.4.2 改了事件驱动补格式、0.4.3/0.4.4 改了 Audio Unit 挂载与诊断，没有单独回归过是哪一步让它生效的；如果方便，把面板里 `音量写入 …AVAudioMixerNode:N` 与 `混音器 已接管 <真实类名>，写入 N 次，最近请求 x → 落地 y` 两行贴回来，就能把缩放点钉死在混音器出口而不是别处。判据本身保留，用于同系列的 Delta/NDS 类模拟器：`音量写入 AVAudioMixerNode:0` 说明写入根本没经过我们 hook 的那个类；`已接管 <真实类名>，写入 N 次，请求 0.60 → 落地 1.00` 说明我们写下的值没被这个对象接受；`请求 0.60 → 落地 0.60` 而音量照旧，才说明混音器不是它的缩放点（那就得往引擎的输出节点方向找）。
+- 注意与抖音短视频的差别：ManicEMU 走 `AVAudioEngine`，缩放点在混音器出口；抖音走 byteaudio/RemoteIO，缩放点在 Audio Unit 交给硬件的缓冲上。两者是不同的拦截层，互不重叠，因此不会把增益乘两次。
 
 ## 适配抖音（AwemeCore + RealX/byteaudio）
 
