@@ -399,7 +399,7 @@ static void QAVHookEngine(void) {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UILabel *title = [UILabel new];
-    title.text = @"App 独立音量 · 0.4.1";
+    title.text = @"App 独立音量 · 0.4.2";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
     UILabel *app = [UILabel new];
     app.text = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: NSBundle.mainBundle.bundleIdentifier;
@@ -504,6 +504,27 @@ static void QAVHookEngine(void) {
     }
     return [parts componentsJoinedByString:@"；"];
 }
+// The fourcc as the SDK writes it, so an unexpected component subtype or a rejected mFormatID can be read off the
+// panel instead of guessed from a decimal code.
+static NSString *QAVFourCC(uint32_t value) {
+    if (!value) return @"-";
+    char raw[4] = { (char)(value >> 24), (char)(value >> 16), (char)(value >> 8), (char)value };
+    NSMutableString *text = [NSMutableString stringWithString:@"'"];
+    for (int index = 0; index < 4; index++) {
+        char symbol = raw[index];
+        [text appendString:(symbol >= 0x20 && symbol <= 0x7e) ? [NSString stringWithFormat:@"%c", symbol] : @"?"];
+    }
+    [text appendString:@"'"];
+    return text;
+}
+// Kept whenever a readable stream description was still refused: the exact bits/channels/bytes-per-frame tell apart
+// a 24-bit packed layout, a padded one, and a probe that simply has no format yet.
+- (NSString *)rejectedFormatSummary:(QAVAudioUnitDiagnostics)units {
+    if (!units.rejectedFormatID) return @"无（两份描述都探不到，或已被候选覆盖）";
+    return [NSString stringWithFormat:@"%@ %.0fHz，%u bit，%u 声道，%u B/帧，flags 0x%X",
+        QAVFourCC(units.rejectedFormatID), units.rejectedSampleRate, units.rejectedBits, units.rejectedChannels,
+        units.rejectedBytesPerFrame, units.rejectedFlags];
+}
 - (void)refreshDiagnostics {
     [QAVLock lock];
     NSUInteger count = QAVPlayers.allObjects.count;
@@ -514,7 +535,7 @@ static void QAVHookEngine(void) {
     char bundle[PATH_MAX] = "", image[PATH_MAX] = "";
     QAVAudioQueueCopyPaths(bundle, sizeof(bundle), image, sizeof(image));
     self.diagnostics.text = [NSString stringWithFormat:
-        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n候选格式：%@\n实测渲染：%u 帧 / %u 字节 / %u 个缓冲\n喇叭输入格式：%u 声道，%u B/帧（status %d）\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，不认识格式 %llu，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
+        @"AVFoundation：%lu 个（音量写入 %@）\nAVAudioEngine 混音器%@\nAudioQueue：%llu 个（累计 %llu），音量应用 %llu 次，队列错误 %d\nAudioUnit：观察到 %llu 个，卸载 %llu 个，App 内新建 %llu 个（最近类型 %@/%@）\n喇叭 bus 缩放 %llu 帧，其它 bus 跳过 %llu 帧，缓冲不符 %llu 次\n各 bus 帧数：b0=%llu b1=%llu b2=%llu b3+=%llu\n候选格式：%@\n实测渲染：%u 帧 / %u 字节 / %u 个缓冲\n喇叭格式 status：输入 %d，输出 %d，%u 声道，%u B/帧\n未识别格式：%@\n麦克风格式：status %d，%u bit\nEnableIO：输出 %d，输入 %d，格式写入 %llu 次，不认识格式 %llu，挂载错误 %d\n已扫描应用模块：%llu / 已见模块：%llu，拦截状态 %d（errno %d）\n应用目录：%@\n首个可见模块：%@\n音量在下一次渲染（或下一次音量写入）时生效。",
         (unsigned long)count,
         [self setterHitSummary],
         [self mixerSummaryLockedRead],
@@ -524,6 +545,9 @@ static void QAVHookEngine(void) {
         queues.lastError,
         (unsigned long long)units.attachedUnits,
         (unsigned long long)units.detachedUnits,
+        (unsigned long long)units.createdInstances,
+        QAVFourCC(units.createdType),
+        QAVFourCC(units.createdSubType),
         (unsigned long long)units.scaledFrames,
         (unsigned long long)units.skippedFrames,
         (unsigned long long)units.geometryMismatches,
@@ -535,13 +559,16 @@ static void QAVHookEngine(void) {
         units.renderFrames,
         units.renderBytes,
         units.renderBuffers,
+        units.speakerFormatStatus,
+        units.hardwareFormatStatus,
         units.speakerChannels,
         units.speakerBytesPerFrame,
-        units.speakerFormatStatus,
+        [self rejectedFormatSummary:units],
         units.micFormatStatus,
         units.micBitsPerChannel,
         units.speakerIO,
         units.micIO,
+        (unsigned long long)units.formatEvents,
         (unsigned long long)units.formatFailures,
         units.lastError,
         (unsigned long long)queues.scannedImages,

@@ -61,12 +61,25 @@ static _Atomic uint32_t QAVUnitRenderBuffers;
 static _Atomic int32_t QAVUnitLastError;
 static _Atomic int32_t QAVUnitLastBus;
 static _Atomic int32_t QAVUnitSpeakerFormatStatus;
+static _Atomic int32_t QAVUnitHardwareFormatStatus;
 static _Atomic int32_t QAVUnitMicFormatStatus;
 static _Atomic uint32_t QAVUnitSpeakerChannels;
 static _Atomic uint32_t QAVUnitSpeakerBytesPerFrame;
 static _Atomic uint32_t QAVUnitMicBits;
 static _Atomic int32_t QAVUnitSpeakerIO;
 static _Atomic int32_t QAVUnitMicIO;
+static _Atomic uint32_t QAVUnitFormatEvents;
+static _Atomic uint32_t QAVUnitCreatedInstances;
+static _Atomic uint32_t QAVUnitCreatedType;
+static _Atomic uint32_t QAVUnitCreatedSubType;
+// The description we were refused, kept verbatim: fourcc plus layout numbers is what tells a 24-bit packed stream
+// from a padded one from a plain 「format not set yet」 probe error.
+static _Atomic uint32_t QAVUnitRejectedFormatID;
+static _Atomic uint32_t QAVUnitRejectedFlags;
+static _Atomic uint32_t QAVUnitRejectedBits;
+static _Atomic uint32_t QAVUnitRejectedChannels;
+static _Atomic uint32_t QAVUnitRejectedBytesPerFrame;
+static _Atomic float QAVUnitRejectedSampleRate;
 
 // The iOS SDK types the notify proc as AURenderCallback, so match that shape exactly.
 static OSStatus QAVGainRenderNotify(void *inRefCon, AudioUnitRenderActionFlags *actionFlags, const AudioTimeStamp *inTimeStamp,
@@ -165,6 +178,19 @@ static bool QAVCandidateFromFormat(const AudioStreamBasicDescription *format, QA
 
 #define QAV_FORMAT_TOO_SHORT -1
 
+static void QAVRecordRejectedFormat(const AudioStreamBasicDescription *format) {
+    atomic_store_explicit(&QAVUnitRejectedFormatID, (uint32_t)format->mFormatID, memory_order_relaxed);
+    atomic_store_explicit(&QAVUnitRejectedFlags, format->mFormatFlags, memory_order_relaxed);
+    atomic_store_explicit(&QAVUnitRejectedBits, format->mBitsPerChannel, memory_order_relaxed);
+    atomic_store_explicit(&QAVUnitRejectedChannels, format->mChannelsPerFrame, memory_order_relaxed);
+    atomic_store_explicit(&QAVUnitRejectedBytesPerFrame, format->mBytesPerFrame, memory_order_relaxed);
+    atomic_store_explicit(&QAVUnitRejectedSampleRate, (float)format->mSampleRate, memory_order_relaxed);
+}
+
+static void QAVClearRejectedFormat(void) {
+    atomic_store_explicit(&QAVUnitRejectedFormatID, 0, memory_order_relaxed);
+}
+
 static OSStatus QAVProbeFormat(AudioUnit unit, AudioUnitScope scope, AudioUnitElement element, AudioStreamBasicDescription *format) {
     UInt32 size = sizeof(*format);
     OSStatus status = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, scope, element, format, &size);
@@ -176,7 +202,6 @@ static OSStatus QAVProbeFormat(AudioUnit unit, AudioUnitScope scope, AudioUnitEl
 // (output scope). Collecting the two turns one assumed layout into a small set of candidates, and the render then
 // picks whichever one its byte count fits; identical descriptions collapse into one.
 static uint32_t QAVResolveCandidates(AudioUnit unit, QAVFormatCandidate *out, uint32_t capacity) {
-    static const AudioUnitScope scopes[] = { kAudioUnitScope_Input, kAudioUnitScope_Output };
     AudioStreamBasicDescription feed;
     OSStatus feedStatus = QAVProbeFormat(unit, kAudioUnitScope_Input, QAV_SPEAKER_BUS, &feed);
     atomic_store_explicit(&QAVUnitSpeakerFormatStatus, (int32_t)feedStatus, memory_order_relaxed);
@@ -184,23 +209,33 @@ static uint32_t QAVResolveCandidates(AudioUnit unit, QAVFormatCandidate *out, ui
         atomic_store_explicit(&QAVUnitSpeakerChannels, feed.mChannelsPerFrame, memory_order_relaxed);
         atomic_store_explicit(&QAVUnitSpeakerBytesPerFrame, feed.mBytesPerFrame, memory_order_relaxed);
     }
+    AudioStreamBasicDescription hardware;
+    OSStatus hardwareStatus = QAVProbeFormat(unit, kAudioUnitScope_Output, QAV_SPEAKER_BUS, &hardware);
+    atomic_store_explicit(&QAVUnitHardwareFormatStatus, (int32_t)hardwareStatus, memory_order_relaxed);
     AudioStreamBasicDescription mic;
     OSStatus micStatus = QAVProbeFormat(unit, kAudioUnitScope_Output, QAV_MIC_BUS, &mic);
     atomic_store_explicit(&QAVUnitMicFormatStatus, (int32_t)micStatus, memory_order_relaxed);
     if (micStatus == noErr) atomic_store_explicit(&QAVUnitMicBits, mic.mBitsPerChannel, memory_order_relaxed);
 
+    const AudioStreamBasicDescription *descriptions[] = {
+        feedStatus == noErr ? &feed : NULL,
+        hardwareStatus == noErr ? &hardware : NULL
+    };
+    QAVClearRejectedFormat();
     uint32_t count = 0;
-    for (size_t index = 0; index < sizeof(scopes) / sizeof(scopes[0]) && count < capacity; index++) {
-        AudioStreamBasicDescription format;
-        if (QAVProbeFormat(unit, scopes[index], QAV_SPEAKER_BUS, &format) != noErr) continue;
+    for (size_t index = 0; index < sizeof(descriptions) / sizeof(descriptions[0]) && count < capacity; index++) {
+        if (!descriptions[index]) continue;
         QAVFormatCandidate candidate;
-        if (!QAVCandidateFromFormat(&format, &candidate)) continue;
-        bool known = false;
-        for (uint32_t previous = 0; previous < count; previous++) {
-            if (out[previous].bytesPerFrame == candidate.bytesPerFrame && out[previous].bitsPerChannel == candidate.bitsPerChannel &&
-                out[previous].isFloat == candidate.isFloat) known = true;
+        if (QAVCandidateFromFormat(descriptions[index], &candidate)) {
+            bool known = false;
+            for (uint32_t previous = 0; previous < count; previous++) {
+                if (out[previous].bytesPerFrame == candidate.bytesPerFrame && out[previous].bitsPerChannel == candidate.bitsPerChannel &&
+                    out[previous].isFloat == candidate.isFloat) known = true;
+            }
+            if (!known) out[count++] = candidate;
+            continue;
         }
-        if (!known) out[count++] = candidate;
+        QAVRecordRejectedFormat(descriptions[index]);
     }
     return count;
 }
@@ -314,6 +349,60 @@ OSStatus QAVDisposeComponentInstance(AudioComponentInstance instance) {
     return AudioComponentInstanceDispose(instance);
 }
 
+// An RTC-style unit is commonly started before it is configured, so a bounded poll is only a guess about timing.
+// Re-resolving when the app itself describes the stream makes the wait event-driven: the notify stops being inert
+// the moment a usable format exists, whatever the moment turns out to be.
+static void QAVRefreshUnit(AudioUnit unit) {
+    if (!unit) return;
+    QAVFormatCandidate candidates[QAV_AUDIO_UNIT_CANDIDATES];
+    uint32_t count = QAVResolveCandidates(unit, candidates, QAV_AUDIO_UNIT_CANDIDATES);
+    pthread_mutex_lock(&QAVUnitLock);
+    QAVUnitSlot *slot = QAVSlotForUnitLocked(unit);
+    if (slot && atomic_load(&slot->unit)) {
+        bool wasInert = atomic_load(&slot->candidateCount) == 0;
+        if (wasInert && count) atomic_fetch_sub_explicit(&QAVUnitFormatFailures, 1, memory_order_relaxed);
+        if (!wasInert && !count) atomic_fetch_add_explicit(&QAVUnitFormatFailures, 1, memory_order_relaxed);
+        QAVPublishCandidates(slot, candidates, count);
+        slot->reprobes = 0;
+    }
+    pthread_mutex_unlock(&QAVUnitLock);
+}
+
+OSStatus QAVSetUnitProperty(AudioUnit unit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement,
+                            const void *inData, UInt32 inDataSize) {
+    OSStatus status = AudioUnitSetProperty(unit, inID, inScope, inElement, inData, inDataSize);
+    // EnableIO is refreshed too: a unit that starts output-only and enables input later changes what its
+    // speaker-side format resolves to, and the panel has to show the state as of now rather than as of start.
+    if (status == noErr && (inID == kAudioUnitProperty_StreamFormat || inID == kAudioOutputUnitProperty_EnableIO)) {
+        atomic_fetch_add_explicit(&QAVUnitFormatEvents, 1, memory_order_relaxed);
+        atomic_store_explicit(&QAVUnitSpeakerIO, QAVCopyIOFlag(unit, kAudioUnitScope_Output, QAV_SPEAKER_BUS), memory_order_relaxed);
+        atomic_store_explicit(&QAVUnitMicIO, QAVCopyIOFlag(unit, kAudioUnitScope_Input, QAV_MIC_BUS), memory_order_relaxed);
+        QAVRefreshUnit(unit);
+    }
+    return status;
+}
+
+OSStatus QAVInitializeUnit(AudioUnit unit) {
+    OSStatus status = AudioUnitInitialize(unit);
+    if (status == noErr) QAVRefreshUnit(unit);
+    return status;
+}
+
+// Creation is counted but deliberately not attached: claiming a slot for every instance an app makes can crowd
+// out the one unit that actually plays, and 32 slots is not generous. Together with the attach count this answers
+// the question a live room raises — whether the unit we would need to scale is even created inside the bundle.
+OSStatus QAVNewComponentInstance(AudioComponent inComponent, AudioComponentInstance *outInstance) {
+    OSStatus status = AudioComponentInstanceNew(inComponent, outInstance);
+    if (status != noErr || !outInstance) return status;
+    atomic_fetch_add_explicit(&QAVUnitCreatedInstances, 1, memory_order_relaxed);
+    AudioComponentDescription description;
+    if (AudioComponentGetDescription(inComponent, &description) == noErr) {
+        atomic_store_explicit(&QAVUnitCreatedType, (uint32_t)description.componentType, memory_order_relaxed);
+        atomic_store_explicit(&QAVUnitCreatedSubType, (uint32_t)description.componentSubType, memory_order_relaxed);
+    }
+    return status;
+}
+
 void QAVAudioUnitSetGain(float gain, bool enabled) {
     atomic_store_explicit(&QAVUnitGain, QAVNormalizeGain(gain), memory_order_relaxed);
     atomic_store_explicit(&QAVUnitEnabled, enabled, memory_order_relaxed);
@@ -371,6 +460,7 @@ QAVAudioUnitDiagnostics QAVAudioUnitGetDiagnostics(void) {
     result.lastError = atomic_load(&QAVUnitLastError);
     result.lastBusNumber = atomic_load(&QAVUnitLastBus);
     result.speakerFormatStatus = atomic_load(&QAVUnitSpeakerFormatStatus);
+    result.hardwareFormatStatus = atomic_load(&QAVUnitHardwareFormatStatus);
     result.micFormatStatus = atomic_load(&QAVUnitMicFormatStatus);
     result.speakerChannels = atomic_load(&QAVUnitSpeakerChannels);
     result.speakerBytesPerFrame = atomic_load(&QAVUnitSpeakerBytesPerFrame);
@@ -380,5 +470,15 @@ QAVAudioUnitDiagnostics QAVAudioUnitGetDiagnostics(void) {
     result.renderFrames = atomic_load(&QAVUnitRenderFrames);
     result.renderBytes = atomic_load(&QAVUnitRenderBytes);
     result.renderBuffers = atomic_load(&QAVUnitRenderBuffers);
+    result.formatEvents = atomic_load(&QAVUnitFormatEvents);
+    result.createdInstances = atomic_load(&QAVUnitCreatedInstances);
+    result.createdType = atomic_load(&QAVUnitCreatedType);
+    result.createdSubType = atomic_load(&QAVUnitCreatedSubType);
+    result.rejectedFormatID = atomic_load(&QAVUnitRejectedFormatID);
+    result.rejectedFlags = atomic_load(&QAVUnitRejectedFlags);
+    result.rejectedBits = atomic_load(&QAVUnitRejectedBits);
+    result.rejectedChannels = atomic_load(&QAVUnitRejectedChannels);
+    result.rejectedBytesPerFrame = atomic_load(&QAVUnitRejectedBytesPerFrame);
+    result.rejectedSampleRate = atomic_load(&QAVUnitRejectedSampleRate);
     return result;
 }

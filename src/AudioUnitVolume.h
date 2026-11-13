@@ -20,6 +20,7 @@ typedef struct {
     int32_t lastError;
     int32_t lastBusNumber;
     int32_t speakerFormatStatus;
+    int32_t hardwareFormatStatus;
     int32_t micFormatStatus;
     uint32_t candidateCount;
     uint32_t candidateBytesPerFrame[QAV_AUDIO_UNIT_CANDIDATES];
@@ -33,12 +34,26 @@ typedef struct {
     uint32_t renderFrames;
     uint32_t renderBytes;
     uint32_t renderBuffers;
+    uint64_t formatEvents;
+    uint64_t createdInstances;
+    uint32_t createdType;
+    uint32_t createdSubType;
+    uint32_t rejectedFormatID;
+    uint32_t rejectedFlags;
+    uint32_t rejectedBits;
+    uint32_t rejectedChannels;
+    uint32_t rejectedBytesPerFrame;
+    float rejectedSampleRate;
 } QAVAudioUnitDiagnostics;
 
 // Bound into the app's own images by the shared scan in AudioQueueVolume.c.
 OSStatus QAVStartOutputUnit(AudioUnit unit);
 OSStatus QAVStopOutputUnit(AudioUnit unit);
 OSStatus QAVDisposeComponentInstance(AudioComponentInstance instance);
+OSStatus QAVNewComponentInstance(AudioComponent inComponent, AudioComponentInstance *outInstance);
+OSStatus QAVSetUnitProperty(AudioUnit unit, AudioUnitPropertyID inID, AudioUnitScope inScope, AudioUnitElement inElement,
+                            const void *inData, UInt32 inDataSize);
+OSStatus QAVInitializeUnit(AudioUnit unit);
 
 // Called from the shared app-image scan; the gain is read lock-free by the render thread.
 void QAVAudioUnitSetGain(float gain, bool enabled);

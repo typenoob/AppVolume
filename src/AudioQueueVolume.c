@@ -238,7 +238,10 @@ static void QAVBindQueueImage(const struct mach_header *header, intptr_t slide, 
         {"AudioQueueDispose", QAVDisposeQueue, NULL},
         {"AudioOutputUnitStart", QAVStartOutputUnit, NULL},
         {"AudioOutputUnitStop", QAVStopOutputUnit, NULL},
-        {"AudioComponentInstanceDispose", QAVDisposeComponentInstance, NULL}
+        {"AudioComponentInstanceNew", QAVNewComponentInstance, NULL},
+        {"AudioComponentInstanceDispose", QAVDisposeComponentInstance, NULL},
+        {"AudioUnitSetProperty", QAVSetUnitProperty, NULL},
+        {"AudioUnitInitialize", QAVInitializeUnit, NULL}
     };
     int result = rebind_symbols_image((void *)header, slide, bindings, sizeof(bindings) / sizeof(bindings[0]));
     pthread_mutex_lock(&QAVQueueLock);
