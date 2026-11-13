@@ -23,6 +23,7 @@ typedef struct {
     int32_t hardwareFormatStatus;
     int32_t micFormatStatus;
     uint32_t candidateCount;
+    uint32_t liveSlots;
     uint32_t candidateBytesPerFrame[QAV_AUDIO_UNIT_CANDIDATES];
     uint32_t candidateBits[QAV_AUDIO_UNIT_CANDIDATES];
     bool candidateIsFloat[QAV_AUDIO_UNIT_CANDIDATES];
